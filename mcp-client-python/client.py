@@ -8,6 +8,9 @@ from mcp.client.stdio import stdio_client
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
+from fastapi import FastAPI, Query
+import uvicorn
+
 load_dotenv()  # load environment variables from .env
 
 class MCPClient:
@@ -62,83 +65,151 @@ class MCPClient:
             "input_schema": tool.inputSchema
         } for tool in response.tools]
 
-        # Initial Claude API call
-        response = self.anthropic.messages.create(
-            model="claude-sonnet-4-5",
-            max_tokens=1000,
-            messages=messages,
-            tools=available_tools
-        )
+        # Agentic loop - continue until we get a final text response
+        final_response = []
+        
+        while True:
+            # Call Claude API
+            response = self.anthropic.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=4096,
+                messages=messages,
+                tools=available_tools
+            )
 
-        # Process response and handle tool calls
-        final_text = []
-
-        for content in response.content:
-            if content.type == 'text':
-                final_text.append(content.text)
-            elif content.type == 'tool_use':
-                tool_name = content.name
-                tool_args = content.input
+            # Add assistant's response to messages
+            assistant_content = []
+            tool_uses = []
+            
+            for content in response.content:
+                assistant_content.append(content)
+                if content.type == 'text':
+                    final_response.append(content.text)
+                elif content.type == 'tool_use':
+                    tool_uses.append(content)
+            
+            messages.append({
+                "role": "assistant",
+                "content": assistant_content
+            })
+            
+            # If no tool uses, we're done
+            if not tool_uses:
+                break
+            
+            # Execute all tool calls and collect results
+            tool_results = []
+            for tool_use in tool_uses:
+                tool_name = tool_use.name
+                tool_args = tool_use.input
+                
+                print(f"[Calling tool {tool_name} with args {tool_args}]")
                 
                 # Execute tool call
                 result = await self.session.call_tool(tool_name, tool_args)
-                final_text.append(f"[Calling tool {tool_name} with args {tool_args}]")
-
-                # Continue conversation with tool results
-                if hasattr(content, 'text') and content.text:
-                    messages.append({
-                      "role": "assistant",
-                      "content": content.text
-                    })
-                messages.append({
-                    "role": "user", 
+                
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": tool_use.id,
                     "content": result.content
                 })
+            
+            # Add tool results to messages
+            messages.append({
+                "role": "user",
+                "content": tool_results
+            })
+            
+            # Check for stop reason to avoid infinite loops
+            if response.stop_reason == "end_turn":
+                break
 
-                # Get next response from Claude
-                response = self.anthropic.messages.create(
-                    model="claude-sonnet-4-5",
-                    max_tokens=1000,
-                    messages=messages,
-                )
+        return "\n".join(final_response)
 
-                final_text.append(response.content[0].text)
-
-        return "\n".join(final_text)
-
-    async def chat_loop(self):
-        """Run an interactive chat loop"""
-        print("\nMCP Client Started!")
-        print("Type your queries or 'quit' to exit.")
-        
-        while True:
-            try:
-                query = input("\nQuery: ").strip()
-                
-                if query.lower() == 'quit':
-                    break
-                    
-                response = await self.process_query(query)
-                print("\n" + response)
-                    
-            except Exception as e:
-                print(f"\nError: {str(e)}")
-    
     async def cleanup(self):
         """Clean up resources"""
         await self.exit_stack.aclose()
 
-async def main():
+
+# Global client instance
+mcp_client = MCPClient()
+app = FastAPI()
+
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize MCP client on server startup"""
+    import sys
     if len(sys.argv) < 2:
+        print("Warning: No server script path provided")
         print("Usage: python client.py <path_to_server_script>")
-        sys.exit(1)
+    else:
+        server_script_path = sys.argv[1]
+        await mcp_client.connect_to_server(server_script_path)
+        print(f"\nFastAPI server starting on http://localhost:8000")
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Clean up MCP client on server shutdown"""
+    await mcp_client.cleanup()
+
+
+@app.get("/")
+async def root():
+    """Root endpoint with usage instructions"""
+    return {
+        "message": "MCP Client API",
+        "usage": "Send GET request to /query?message=your_query_here",
+        "example": "http://localhost:8000/query?message=Hello"
+    }
+
+
+@app.get("/query")
+async def query_endpoint(message: str = Query(..., description="The query message to process")):
+    """
+    Process a query through the MCP client
+    
+    Args:
+        message: The query string to process
         
-    client = MCPClient()
+    Returns:
+        JSON response with the result
+    """
     try:
-        await client.connect_to_server(sys.argv[1])
-        await client.chat_loop()
-    finally:
-        await client.cleanup()
+        if not mcp_client.session:
+            return {
+                "error": "MCP client not connected. Please provide server script path.",
+                "status": "error"
+            }
+        
+        response = await mcp_client.process_query(message)
+        return {
+            "query": message,
+            "response": response,
+            "status": "success"
+        }
+    except Exception as e:
+        return {
+            "query": message,
+            "error": str(e),
+            "status": "error"
+        }
+
+
+async def main():
+    import sys
+    
+    # Run FastAPI server
+    config = uvicorn.Config(
+        app,
+        host="0.0.0.0",
+        port=8000,
+        log_level="info"
+    )
+    server = uvicorn.Server(config)
+    await server.serve()
+
 
 if __name__ == "__main__":
     import sys
